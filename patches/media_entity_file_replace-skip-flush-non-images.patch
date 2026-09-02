@@ -1,0 +1,22 @@
+diff --git a/media_entity_file_replace.module b/media_entity_file_replace.module
+--- a/media_entity_file_replace.module
++++ b/media_entity_file_replace.module
+@@ -361,9 +361,15 @@ function _media_entity_file_replace_submit(array $form, FormStateInterface $for
+     // the file (like size).
+     $originalFile->save();
+
+-    // Delete image style derivatives for this file. If it's not an image, this
+-    // is harmless.
+-    image_path_flush($originalFile->getFileUri());
++    // Delete image style derivatives for this file, but only when the file is
++    // actually an image. image_path_flush() checks for a derivative of every
++    // image style on the site, and on network filesystems (Pantheon, Acquia)
++    // each check is a slow remote stat() call. With 100+ image styles that
++    // adds many seconds to every replace, for nothing, when the file is a
++    // document.
++    if (str_starts_with($originalFile->getMimeType() ?? '', 'image/')) {
++      image_path_flush($originalFile->getFileUri());
++    }
+
+     // The replacement file is marked as temporary and will typically be
+     // automatically deleted on cron after a certain period of time, but

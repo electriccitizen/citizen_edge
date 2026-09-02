@@ -1,0 +1,115 @@
+<?php
+
+/**
+ * @file
+ * Media file lifecycle: edge cache purging on file replace and delete.
+ */
+
+use Drupal\file\FileInterface;
+
+/**
+ * Builds one setup decision for the setup routines' reports.
+ *
+ * @param string $level
+ *   A PSR-3 level: notice, warning, or error.
+ * @param string $message
+ *   What was done, or would be done on a dry run.
+ *
+ * @return array
+ *   A [level, message] pair.
+ */
+function _citizen_edge_decision(string $level, string $message): array {
+  return [$level, $message];
+}
+
+/**
+ * Writes setup decisions to the module's log channel.
+ *
+ * @param array[] $decisions
+ *   The [level, message] pairs as returned by the setup routines.
+ */
+function _citizen_edge_log_decisions(array $decisions): void {
+  $logger = \Drupal::logger('citizen_edge');
+  foreach ($decisions as [$level, $message]) {
+    $logger->log($level, $message);
+  }
+}
+
+/**
+ * Implements hook_views_data_alter().
+ *
+ * Exposes the self-contained usage count field on media views.
+ */
+function citizen_edge_views_data_alter(array &$data) {
+  $data['media']['citizen_edge_usage_count'] = [
+    'title' => t('Usage count (Citizen Edge)'),
+    'help' => t('Number of places this media item is used, with a link to the full usage list. Adds nothing to the view query.'),
+    'field' => [
+      'id' => 'citizen_edge_usage_count',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_module_preuninstall().
+ *
+ * Strips this module's usage count field out of any view before the config
+ * system's dependency cascade runs. Without this, uninstalling the module
+ * DELETES every view carrying the field (the whole media admin view, not
+ * just the column) — confirmed in the field.
+ */
+function citizen_edge_module_preuninstall($module) {
+  if ($module !== 'citizen_edge') {
+    return;
+  }
+  foreach (\Drupal::entityTypeManager()->getStorage('view')->loadMultiple() as $view) {
+    $changed = FALSE;
+    $displays = $view->get('display');
+    foreach ($displays as &$display) {
+      if (isset($display['display_options']['fields']['citizen_edge_usage_count'])) {
+        unset($display['display_options']['fields']['citizen_edge_usage_count']);
+        $changed = TRUE;
+      }
+    }
+    unset($display);
+    if ($changed) {
+      $view->set('display', $displays);
+      $view->save();
+      \Drupal::logger('citizen_edge')->notice('Removed the usage count field from the @view view before uninstall.', ['@view' => $view->id()]);
+    }
+  }
+}
+
+/**
+ * Implements hook_file_update().
+ *
+ * Fires when a file entity is re-saved, which includes Media Entity File
+ * Replace overwriting a file's contents in place (same URI, same URL). The
+ * edge cache still holds the old contents at that URL, so purge it.
+ *
+ * A brand-new upload also passes through here once, when the media save
+ * promotes the file from temporary to permanent. Nothing has ever been
+ * served at that URL with different contents, so that transition is skipped:
+ * only files that were already permanent before this save are purged.
+ */
+function citizen_edge_file_update(FileInterface $file) {
+  if (!$file->isPermanent()) {
+    return;
+  }
+  // getOriginal() arrived in 11.2; the property is the 10.3 fallback.
+  $original = method_exists($file, 'getOriginal') ? $file->getOriginal() : ($file->original ?? NULL);
+  if ($original instanceof FileInterface && !$original->isPermanent()) {
+    return;
+  }
+  \Drupal::service('citizen_edge.edge_purger')->purgeFile($file, 'file updated/replaced');
+}
+
+/**
+ * Implements hook_file_delete().
+ *
+ * Fires when a file entity is deleted, including deletions triggered by
+ * Media File Delete when a media entity and its file are removed together.
+ */
+function citizen_edge_file_delete(FileInterface $file) {
+  \Drupal::service('citizen_edge.edge_purger')->purgeFile($file, 'file deleted');
+}

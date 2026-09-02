@@ -1,0 +1,265 @@
+<?php
+
+/**
+ * @file
+ * Install-time defaults for the Citizen Edge package.
+ *
+ * The defaults adapt to the site they land on instead of shipping static
+ * config, because media type machine names, roles, and views differ across
+ * sites. Anything that cannot be applied safely is logged rather than forced.
+ *
+ * Everything hook_install() does is also available, re-runnably and with a
+ * dry-run mode, through `drush ce:setup` — the setup routine returns the
+ * list of decisions it made (or would make) so a reviewer can read exactly
+ * what a site will get before it gets it.
+ */
+
+use Drupal\media\Plugin\media\Source\File as FileSource;
+use Drupal\user\Entity\Role;
+use Drupal\views\Entity\View;
+
+/**
+ * Implements hook_install().
+ */
+function citizen_edge_install() {
+  _citizen_edge_log_decisions(citizen_edge_setup());
+}
+
+/**
+ * Applies the adaptive EC baseline and reports every decision.
+ *
+ * Idempotent: a second run finds everything already in place and only
+ * reports skips.
+ *
+ * @param bool $dry_run
+ *   When TRUE nothing is saved; the decisions describe what would change.
+ *
+ * @return array[]
+ *   A list of [level, message] pairs, level being notice, warning, or error.
+ */
+function citizen_edge_setup(bool $dry_run = FALSE): array {
+  return array_merge(
+    _citizen_edge_apply_entity_usage_defaults($dry_run),
+    _citizen_edge_enable_replace_widgets($dry_run),
+    _citizen_edge_grant_permissions($dry_run),
+    _citizen_edge_add_usage_to_media_view($dry_run),
+    _citizen_edge_default_delete_file($dry_run),
+  );
+}
+
+/**
+ * Applies the EC baseline entity_usage settings.
+ *
+ * Skipped unless the stored config is byte-identical to entity_usage's
+ * shipped install defaults, so an existing site's tracking choices are never
+ * overwritten.
+ */
+function _citizen_edge_apply_entity_usage_defaults(bool $dry_run = FALSE): array {
+  $config = \Drupal::configFactory()->getEditable('entity_usage.settings');
+  // Only apply the baseline when the stored config is byte-identical to
+  // entity_usage's shipped install defaults. Any deviation at all means the
+  // site made choices (which can be as subtle as a local-task or warning
+  // list, with no tracking lists present — seen on a live site), and those are
+  // never overwritten.
+  $shipped = [
+    'track_enabled_base_fields' => FALSE,
+    'local_task_enabled_entity_types' => [],
+    'usage_controller_items_per_page' => 25,
+  ];
+  $data = $config->getRawData();
+  unset($data['_core']);
+  if ($data != $shipped) {
+    return [
+      _citizen_edge_decision('notice', 'entity_usage is already configured on this site; leaving its settings untouched. Compare them against the EC baseline manually.'),
+    ];
+  }
+  if (!$dry_run) {
+    $config
+      ->set('local_task_enabled_entity_types', ['media', 'node'])
+      ->set('track_enabled_source_entity_types', ['block_content', 'node', 'paragraph'])
+      ->set('track_enabled_target_entity_types', ['media', 'node'])
+      ->set('track_enabled_plugins', [
+        'dynamic_entity_reference',
+        'entity_embed',
+        'entity_reference',
+        'html_link',
+        'link',
+        'linkit',
+        'media_embed',
+      ])
+      ->set('track_enabled_base_fields', FALSE)
+      ->set('delete_warning_message_entity_types', ['media'])
+      ->set('usage_controller_items_per_page', 25)
+      ->save();
+  }
+  return [
+    _citizen_edge_decision('notice', ($dry_run ? 'Would apply' : 'Applied') . ' EC baseline entity_usage settings (stored config matched the shipped defaults).'),
+  ];
+}
+
+/**
+ * Enables the MEFR "Replace file" widget on every file-backed media type.
+ */
+function _citizen_edge_enable_replace_widgets(bool $dry_run = FALSE): array {
+  $decisions = [];
+  $display_repository = \Drupal::service('entity_display.repository');
+  $types = \Drupal::entityTypeManager()->getStorage('media_type')->loadMultiple();
+  foreach ($types as $type) {
+    /** @var \Drupal\media\MediaTypeInterface $type */
+    if (!$type->getSource() instanceof FileSource) {
+      continue;
+    }
+    $form_display = $display_repository->getFormDisplay('media', $type->id(), 'default');
+    if ($form_display->getComponent('replace_file')) {
+      $decisions[] = _citizen_edge_decision('notice', "The {$type->id()} media form already shows the Replace file widget.");
+      continue;
+    }
+    // A display whose STORED config lists replace_file as hidden was saved
+    // with that choice (seen in the field); respect it rather than overriding
+    // site configuration. The stored config must be read directly — the loaded
+    // display entity computes default-hidden extra fields into its hidden
+    // list at runtime, which false-positives on every fresh site.
+    $stored_hidden = \Drupal::config('core.entity_form_display.media.' . $type->id() . '.default')->get('hidden') ?? [];
+    if (isset($stored_hidden['replace_file'])) {
+      $decisions[] = _citizen_edge_decision('notice', "The {$type->id()} media form explicitly hides the Replace file widget; leaving it hidden.");
+      continue;
+    }
+    if (!$dry_run) {
+      $form_display->setComponent('replace_file', ['weight' => 3, 'region' => 'content']);
+      $form_display->save();
+    }
+    $decisions[] = _citizen_edge_decision('notice', ($dry_run ? 'Would enable' : 'Enabled') . " the Replace file widget on the {$type->id()} media form.");
+  }
+  return $decisions;
+}
+
+/**
+ * Grants package permissions to a site-manager-style role when one exists.
+ *
+ * Only permissions defined by the bundled modules are granted. File replace
+ * needs no permission of its own (it follows media update access), and file
+ * delete access is granted per Media File Delete's permission set when
+ * present.
+ */
+function _citizen_edge_grant_permissions(bool $dry_run = FALSE): array {
+  $role = NULL;
+  foreach (['site_manager', 'site_admin', 'manager'] as $candidate) {
+    if ($role = Role::load($candidate)) {
+      break;
+    }
+  }
+  if (!$role) {
+    return [
+      _citizen_edge_decision('warning', 'No site-manager-style role found (looked for site_manager, site_admin, manager). Grant "access entity usage statistics" and the Media File Delete permissions manually.'),
+    ];
+  }
+  $defined = \Drupal::service('user.permissions')->getPermissions();
+  // "delete any file" is what lets Media File Delete's checkbox delete files
+  // the user does not own (its access handler grants file delete on it). It
+  // is a core restrict-access permission that covers EVERY file entity, not
+  // only media-backed ones, which is why it goes to a manager-tier role and
+  // nothing broader. The module's "administer media file delete" settings
+  // permission is deliberately NOT granted.
+  $wanted = ['access entity usage statistics', 'delete any file'];
+  $granted = [];
+  foreach ($wanted as $name) {
+    if (isset($defined[$name]) && !$role->hasPermission($name)) {
+      $granted[] = $name;
+    }
+  }
+  if (!$granted) {
+    return [
+      _citizen_edge_decision('notice', "Role {$role->id()} already holds the package permissions."),
+    ];
+  }
+  if (!$dry_run) {
+    foreach ($granted as $name) {
+      $role->grantPermission($name);
+    }
+    $role->save();
+  }
+  return [
+    _citizen_edge_decision('notice', ($dry_run ? 'Would grant' : 'Granted') . " to role {$role->id()}: " . implode(', ', $granted)),
+  ];
+}
+
+/**
+ * Adds a "Usage count" column to the media admin view.
+ *
+ * Uses the module's own non-SQL views field (count + View Usage link,
+ * mirroring the EC reference column's presentation) rather than an entity_usage
+ * relationship/aggregation recipe, which only works on views built for
+ * aggregation. Skipped with a log message when the view is missing or already
+ * carries a usage column (either the native entity_usage relationship or this
+ * module's field).
+ */
+function _citizen_edge_add_usage_to_media_view(bool $dry_run = FALSE): array {
+  $view = View::load('media');
+  if (!$view) {
+    return [
+      _citizen_edge_decision('warning', 'No views.view.media found; add the entity_usage count column to your media listing manually.'),
+    ];
+  }
+  $display = &$view->getDisplay('default');
+  if (isset($display['display_options']['relationships']['media_to_usage_entity'])) {
+    return [
+      _citizen_edge_decision('notice', 'The media view already has the entity_usage relationship; leaving it untouched.'),
+    ];
+  }
+  if (isset($display['display_options']['fields']['citizen_edge_usage_count'])) {
+    return [
+      _citizen_edge_decision('notice', 'The media view already has the usage count field; leaving it untouched.'),
+    ];
+  }
+  if ($dry_run) {
+    return [
+      _citizen_edge_decision('notice', 'Would add the "Usage count" column to the media admin view.'),
+    ];
+  }
+  try {
+    // The module's own non-SQL field plugin: adds no relationship, join, or
+    // aggregation, so it cannot break the host view's query. Never inject
+    // views aggregation into an existing view — flipping group_by on one site's
+    // media view produced malformed SQL from a file field that does not
+    // aggregate.
+    $display['display_options']['fields']['citizen_edge_usage_count'] = [
+      'id' => 'citizen_edge_usage_count',
+      'table' => 'media',
+      'field' => 'citizen_edge_usage_count',
+      'relationship' => 'none',
+      'plugin_id' => 'citizen_edge_usage_count',
+      'label' => 'Usage count',
+      'exclude' => FALSE,
+    ];
+    $view->save();
+    return [
+      _citizen_edge_decision('notice', 'Added the "Usage count" column to the media admin view.'),
+    ];
+  }
+  catch (\Exception $e) {
+    return [
+      _citizen_edge_decision('error', 'Could not add the usage column to the media view: ' . $e->getMessage() . '. Add the "Usage count (Citizen Edge)" field manually.'),
+    ];
+  }
+}
+
+/**
+ * Defaults Media File Delete's "also delete the file" checkbox to checked.
+ *
+ * An unchecked default quietly recreates the orphaned-file problem this
+ * package exists to solve; editors can still uncheck it per delete.
+ */
+function _citizen_edge_default_delete_file(bool $dry_run = FALSE): array {
+  $config = \Drupal::configFactory()->getEditable('media_file_delete.settings');
+  if ($config->get('delete_file_default')) {
+    return [
+      _citizen_edge_decision('notice', 'Media File Delete already defaults to deleting the file with the media entity.'),
+    ];
+  }
+  if (!$dry_run) {
+    $config->set('delete_file_default', TRUE)->save();
+  }
+  return [
+    _citizen_edge_decision('notice', ($dry_run ? 'Would default' : 'Defaulted') . ' Media File Delete to deleting the file with the media entity.'),
+  ];
+}

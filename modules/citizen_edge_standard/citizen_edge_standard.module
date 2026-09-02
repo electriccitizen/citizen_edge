@@ -1,0 +1,54 @@
+<?php
+
+/**
+ * @file
+ * EC-standard enforcement: media view styling and replace-widget gating.
+ */
+
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Hook\Attribute\LegacyModuleImplementsAlter;
+use Drupal\views\ViewExecutable;
+
+/**
+ * Implements hook_views_pre_render().
+ *
+ * Attaches the media admin styling (adapted from an EC site theme's
+ * admin.css) wherever the media admin or media library views render.
+ */
+function citizen_edge_standard_views_pre_render(ViewExecutable $view) {
+  if (in_array($view->id(), ['media', 'media_library'], TRUE)) {
+    $view->element['#attached']['library'][] = 'citizen_edge_standard/media-admin';
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for media_form.
+ *
+ * Gates Media Entity File Replace's widget on the "replace media files"
+ * permission. MEFR itself has no permission — its widget follows media
+ * update access — and the EC standard restricts replacing to site managers.
+ * Runs after MEFR's own alter (see the implements_alter below).
+ */
+function citizen_edge_standard_form_media_form_alter(&$form, FormStateInterface $form_state, $form_id) {
+  if (isset($form['replace_file'])) {
+    $form['replace_file']['#access'] = \Drupal::currentUser()->hasPermission('replace media files');
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * MEFR adds its widget in the same alter phase and "citizen..." sorts before
+ * "media_entity...", so this module must be pushed last or the element does
+ * not exist yet when the gate runs. The attribute keeps this procedural
+ * implementation honored under the 11.2+ OOP hook collector (the class does
+ * not exist on 10.3, where PHP simply ignores the unresolved attribute).
+ */
+#[LegacyModuleImplementsAlter]
+function citizen_edge_standard_module_implements_alter(&$implementations, $hook) {
+  if ($hook === 'form_alter' && isset($implementations['citizen_edge_standard'])) {
+    $group = $implementations['citizen_edge_standard'];
+    unset($implementations['citizen_edge_standard']);
+    $implementations['citizen_edge_standard'] = $group;
+  }
+}

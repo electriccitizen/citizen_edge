@@ -1,0 +1,8 @@
+name: 'Citizen Edge Standard'
+type: module
+description: 'Enforces the EC standard media setup: entity_usage baseline, replace widgets, delete defaults, the site_manager/editor permission matrix, and the standard media view columns + admin CSS. Enabling this deliberately overrides existing configuration.'
+package: 'Electric Citizen'
+core_version_requirement: ^10.3 || ^11
+dependencies:
+  - citizen_edge:citizen_edge
+  - drupal:views

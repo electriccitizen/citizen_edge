@@ -1,0 +1,11 @@
+name: 'Citizen Edge'
+type: module
+description: 'Portable media file lifecycle package: entity usage tracking, file replace, file delete, and host-aware CDN cache purging on file replace/delete.'
+package: 'Electric Citizen'
+core_version_requirement: ^10.3 || ^11
+dependencies:
+  - drupal:media
+  - drupal:file
+  - entity_usage:entity_usage
+  - media_entity_file_replace:media_entity_file_replace
+  - media_file_delete:media_file_delete

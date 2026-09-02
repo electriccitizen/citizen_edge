@@ -1,0 +1,335 @@
+<?php
+
+/**
+ * @file
+ * Enforces the EC standard media setup (the EC editorial media spec).
+ *
+ * Unlike the base module's adaptive install, everything here deliberately
+ * OVERRIDES existing configuration — enabling this submodule is the opt-in
+ * to EC standardization. Exceptions: the media view's filters, sorts, pager,
+ * and style are never touched (the merge replaces columns only), and no
+ * views aggregation is ever enabled.
+ *
+ * Re-runnable with a dry-run mode through `drush ce:setup --standard`; see
+ * citizen_edge_standard_setup().
+ */
+
+use Drupal\Core\Serialization\Yaml;
+use Drupal\media\Plugin\media\Source\File as FileSource;
+use Drupal\user\Entity\Role;
+
+/**
+ * Implements hook_install().
+ */
+function citizen_edge_standard_install() {
+  \Drupal::moduleHandler()->loadInclude('citizen_edge', 'install');
+  _citizen_edge_log_decisions(citizen_edge_standard_setup());
+}
+
+/**
+ * Applies the EC standard and reports every decision.
+ *
+ * @param bool $dry_run
+ *   When TRUE nothing is saved; the decisions describe what would change.
+ *
+ * @return array[]
+ *   A list of [level, message] pairs, level being notice, warning, or error.
+ */
+function citizen_edge_standard_setup(bool $dry_run = FALSE): array {
+  return array_merge(
+    _citizen_edge_standard_entity_usage($dry_run),
+    _citizen_edge_standard_widgets($dry_run),
+    _citizen_edge_standard_delete_default($dry_run),
+    _citizen_edge_standard_permissions($dry_run),
+    _citizen_edge_standard_media_view($dry_run),
+  );
+}
+
+/**
+ * Forces the EC baseline entity_usage settings.
+ */
+function _citizen_edge_standard_entity_usage(bool $dry_run = FALSE): array {
+  if (!$dry_run) {
+    \Drupal::configFactory()->getEditable('entity_usage.settings')
+      ->set('local_task_enabled_entity_types', ['media', 'node'])
+      ->set('track_enabled_source_entity_types', ['block_content', 'node', 'paragraph'])
+      ->set('track_enabled_target_entity_types', ['media', 'node'])
+      ->set('track_enabled_plugins', [
+        'dynamic_entity_reference',
+        'entity_embed',
+        'entity_reference',
+        'html_link',
+        'link',
+        'linkit',
+        'media_embed',
+      ])
+      ->set('track_enabled_base_fields', FALSE)
+      ->set('delete_warning_message_entity_types', ['media'])
+      ->set('usage_controller_items_per_page', 25)
+      ->save();
+  }
+  return [
+    _citizen_edge_decision('notice', 'STANDARD: ' . ($dry_run ? 'would force' : 'forced') . ' EC baseline entity_usage settings.'),
+  ];
+}
+
+/**
+ * Forces the MEFR replace widget onto every file-backed media type.
+ */
+function _citizen_edge_standard_widgets(bool $dry_run = FALSE): array {
+  $decisions = [];
+  $display_repository = \Drupal::service('entity_display.repository');
+  foreach (\Drupal::entityTypeManager()->getStorage('media_type')->loadMultiple() as $type) {
+    /** @var \Drupal\media\MediaTypeInterface $type */
+    if (!$type->getSource() instanceof FileSource) {
+      continue;
+    }
+    $form_display = $display_repository->getFormDisplay('media', $type->id(), 'default');
+    if ($form_display->getComponent('replace_file')) {
+      continue;
+    }
+    if (!$dry_run) {
+      $form_display->setComponent('replace_file', ['weight' => 3, 'region' => 'content']);
+      $form_display->save();
+    }
+    $decisions[] = _citizen_edge_decision('notice', 'STANDARD: ' . ($dry_run ? 'would enable' : 'enabled') . " the Replace file widget on the {$type->id()} media form.");
+  }
+  return $decisions;
+}
+
+/**
+ * Forces Media File Delete to delete the file with the media entity.
+ */
+function _citizen_edge_standard_delete_default(bool $dry_run = FALSE): array {
+  $config = \Drupal::configFactory()->getEditable('media_file_delete.settings');
+  if ($config->get('delete_file_default')) {
+    return [];
+  }
+  if (!$dry_run) {
+    $config->set('delete_file_default', TRUE)->save();
+  }
+  return [
+    _citizen_edge_decision('notice', 'STANDARD: ' . ($dry_run ? 'would default' : 'defaulted') . ' Media File Delete to deleting the file with the media entity.'),
+  ];
+}
+
+/**
+ * Applies the EC permission matrix.
+ *
+ * Only site managers delete or replace media and run entity usage batch
+ * updates; editors see usage statistics. Every revocation is logged so a
+ * site that intentionally diverged can be spotted and re-granted.
+ */
+function _citizen_edge_standard_permissions(bool $dry_run = FALSE): array {
+  $decisions = [];
+  $defined = \Drupal::service('user.permissions')->getPermissions();
+  $manager_only = ['delete any file', 'replace media files', 'perform batch updates entity usage'];
+  $would = $dry_run ? 'would ' : '';
+
+  $site_manager = Role::load('site_manager');
+  if (!$site_manager) {
+    // Without a site_manager role we cannot know which role is the
+    // manager-equivalent, so REVOCATIONS would disarm it — on one site they
+    // stripped site_admin (its actual manager role) of every delete
+    // power. Warn, skip the matrix, but STILL run the grants-only
+    // grandfather pass below: otherwise the replace-widget gate locks
+    // manager-tier roles (a role simply named "manager") out of replacing
+    // entirely.
+    $decisions[] = _citizen_edge_decision('warning', 'STANDARD: no site_manager role on this site, so the permission matrix was NOT applied (manager-tier roles holding delete permissions are still grandfathered below). Grant "delete any file", "replace media files", "perform batch updates entity usage", and "access entity usage statistics" to whatever role takes its place, and revoke media-delete permissions from other roles manually.');
+  }
+  else {
+    $granted = [];
+    foreach (array_merge($manager_only, ['access entity usage statistics']) as $perm) {
+      if (isset($defined[$perm]) && !$site_manager->hasPermission($perm)) {
+        $granted[] = $perm;
+      }
+    }
+    if ($granted) {
+      if (!$dry_run) {
+        foreach ($granted as $perm) {
+          $site_manager->grantPermission($perm);
+        }
+        $site_manager->save();
+      }
+      $decisions[] = _citizen_edge_decision('notice', "STANDARD: {$would}granted site_manager: " . implode(', ', $granted));
+    }
+    else {
+      $decisions[] = _citizen_edge_decision('notice', 'STANDARD: site_manager already holds the media delete/replace/usage permission set.');
+    }
+
+    $editor = Role::load('editor');
+    if ($editor) {
+      $grant_stats = isset($defined['access entity usage statistics']) && !$editor->hasPermission('access entity usage statistics');
+      if ($grant_stats) {
+        $decisions[] = _citizen_edge_decision('notice', "STANDARD: {$would}granted editor \"access entity usage statistics\".");
+      }
+      // Editor is the one role the spec explicitly demotes: usage
+      // statistics yes, deleting or replacing no.
+      $revoked = [];
+      foreach ($editor->getPermissions() as $perm) {
+        if (in_array($perm, $manager_only, TRUE) || $perm === 'delete media' || _citizen_edge_standard_is_media_delete_perm($perm)) {
+          $revoked[] = $perm;
+        }
+      }
+      if ($revoked) {
+        $decisions[] = _citizen_edge_decision('notice', "STANDARD: {$would}revoked from editor: " . implode(', ', $revoked) . ' (only site managers delete/replace media).');
+      }
+      if (($grant_stats || $revoked) && !$dry_run) {
+        if ($grant_stats) {
+          $editor->grantPermission('access entity usage statistics');
+        }
+        foreach ($revoked as $perm) {
+          $editor->revokePermission($perm);
+        }
+        $editor->save();
+      }
+    }
+  }
+
+  // Custom/unfamiliar roles that already hold delete permissions were set up
+  // that way deliberately for the client (a site_administrator or
+  // editor_plus role, say). Treat them as manager-tier: revoke nothing, and
+  // grant the working set so their capability survives the new gates — in
+  // particular the "replace media files" gate would otherwise silently
+  // remove the replace widget from them. Note that the working set includes
+  // "delete any file", core's restrict-access permission over EVERY file
+  // entity: a conscious yes on each client site, which is why it is logged
+  // by role name here.
+  foreach (Role::loadMultiple() as $role) {
+    if (in_array($role->id(), ['site_manager', 'administrator', 'editor', 'anonymous', 'authenticated'], TRUE) || $role->isAdmin()) {
+      continue;
+    }
+    $has_delete = FALSE;
+    foreach ($role->getPermissions() as $perm) {
+      if (in_array($perm, ['delete any file', 'delete media'], TRUE) || _citizen_edge_standard_is_media_delete_perm($perm)) {
+        $has_delete = TRUE;
+        break;
+      }
+    }
+    if (!$has_delete) {
+      continue;
+    }
+    $granted = [];
+    foreach (['delete any file', 'replace media files', 'access entity usage statistics'] as $perm) {
+      if (isset($defined[$perm]) && !$role->hasPermission($perm)) {
+        $granted[] = $perm;
+      }
+    }
+    if ($granted && !$dry_run) {
+      foreach ($granted as $perm) {
+        $role->grantPermission($perm);
+      }
+      $role->save();
+    }
+    $decisions[] = _citizen_edge_decision('notice', "STANDARD: role {$role->id()} already holds delete permissions — treated as manager-tier (client-configured), nothing revoked" . ($granted ? ", {$would}granted: " . implode(', ', $granted) : '') . '.');
+  }
+
+  // Anonymous/authenticated holding delete permissions is never deliberate
+  // role design worth grandfathering — surface it instead.
+  foreach (['anonymous', 'authenticated'] as $rid) {
+    $role = Role::load($rid);
+    if ($role) {
+      foreach ($role->getPermissions() as $perm) {
+        if (in_array($perm, ['delete any file', 'delete media'], TRUE) || _citizen_edge_standard_is_media_delete_perm($perm)) {
+          $decisions[] = _citizen_edge_decision('warning', "STANDARD: the $rid role holds \"$perm\" — review this manually; it was left unchanged.");
+        }
+      }
+    }
+  }
+  return $decisions;
+}
+
+/**
+ * Whether a permission string is a media-entity delete permission.
+ */
+function _citizen_edge_standard_is_media_delete_perm(string $perm): bool {
+  // Core's "delete any media" / "delete own media" and any per-bundle
+  // variant such as "delete any document media".
+  return (bool) preg_match('/^delete (any|own)( .+)? media$/', $perm);
+}
+
+/**
+ * Merges the EC-standard columns into the site's media view.
+ *
+ * Replaces the view's FIELDS (and adds the relationships they need) while
+ * leaving filters, sorts, pager, style, and aggregation settings untouched
+ * (never lose site customizations like exposed Tags filters, and never
+ * enable aggregation — flipping group_by on a foreign view broke a live
+ * site). Site-conditional columns are pruned where the underlying field is
+ * missing. If the site has no media view at all, the full EC-standard view
+ * is created. The rollback for the merge is the site's exported config in
+ * git (the previous view is also kept in state under
+ * citizen_edge_standard.previous_view for convenience, but state does
+ * not survive a database refresh; git does).
+ */
+function _citizen_edge_standard_media_view(bool $dry_run = FALSE): array {
+  $packaged = Yaml::decode(file_get_contents(__DIR__ . '/config/views.view.media.yml'));
+  $field_storage = \Drupal::entityTypeManager()->getStorage('field_storage_config');
+
+  // Standard fields and the relationships they need, from the packaged view.
+  $std_fields = $packaged['display']['default']['display_options']['fields'];
+  $std_relationships = $packaged['display']['default']['display_options']['relationships'];
+  $prunes = [];
+  if (!$field_storage->load('media.field_media_image')) {
+    unset($std_fields['filesize'], $std_relationships['field_media_image_target_id']);
+    $prunes[] = 'Image size column (no media.field_media_image)';
+  }
+
+  $storage = \Drupal::entityTypeManager()->getStorage('view');
+  $view = $storage->load('media');
+
+  if (!$view) {
+    // No media view: create the full standard one (prune its Tags filter if
+    // the field is absent; existing-view merges never touch filters).
+    if (!$field_storage->load('media.field_media_tags')) {
+      foreach ($packaged['display'] as &$disp) {
+        unset($disp['display_options']['filters']['field_media_tags_target_id']);
+      }
+      unset($disp);
+      $prunes[] = 'Tags filter (no media.field_media_tags)';
+    }
+    foreach ($packaged['display'] as &$disp) {
+      if (isset($disp['display_options']['fields'])) {
+        $disp['display_options']['fields'] = $std_fields;
+        $disp['display_options']['relationships'] = $std_relationships;
+      }
+    }
+    unset($disp);
+    if (!$dry_run) {
+      $storage->create($packaged)->save();
+    }
+    return [
+      _citizen_edge_decision('notice', 'STANDARD: no media view existed; ' . ($dry_run ? 'would create' : 'created') . ' the EC-standard view.' . ($prunes ? ' Pruned: ' . implode('; ', $prunes) : '')),
+    ];
+  }
+
+  $displays = $view->get('display');
+  $touched = [];
+  foreach ($displays as $display_id => &$display) {
+    // Merge into the default display and any display that overrides fields.
+    if ($display_id !== 'default' && !isset($display['display_options']['fields'])) {
+      continue;
+    }
+    if (($display['display_options']['fields'] ?? NULL) === $std_fields) {
+      continue;
+    }
+    $display['display_options']['fields'] = $std_fields;
+    $existing_rels = $display['display_options']['relationships'] ?? [];
+    $display['display_options']['relationships'] = $existing_rels + $std_relationships;
+    $touched[] = $display_id;
+  }
+  unset($display);
+  if (!$touched) {
+    return [
+      _citizen_edge_decision('notice', 'STANDARD: the media view already carries the EC-standard columns.'),
+    ];
+  }
+  if (!$dry_run) {
+    \Drupal::state()->set('citizen_edge_standard.previous_view', $view->toArray());
+    $view->set('display', $displays);
+    $view->save();
+  }
+  return [
+    _citizen_edge_decision('notice', 'STANDARD: ' . ($dry_run ? 'would merge' : 'merged') . ' EC-standard columns into the media view (displays: ' . implode(', ', $touched) . '); filters, sorts, pager, and style untouched.' . ($prunes ? ' Pruned: ' . implode('; ', $prunes) : '')),
+  ];
+}

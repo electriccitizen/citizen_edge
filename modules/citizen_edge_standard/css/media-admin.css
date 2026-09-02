@@ -1,0 +1,40 @@
+/**
+ * EC-standard media admin styling.
+ *
+ * Adapted from an EC site theme's admin CSS media library block
+ * (typo in the original .views-live-preview selector fixed here).
+ */
+
+/* Media library grid adjustments. */
+#media-library-wrapper {
+  padding-top: 20px;
+}
+#media-library-wrapper .media-library-item--grid .media-library-item__content,
+.views-live-preview .media-library-item--grid .media-library-item__content {
+  flex-direction: column;
+}
+#media-library-wrapper .media-library-item--grid .media-library-item__content .dimensions,
+.views-live-preview .media-library-item--grid .media-library-item__content .dimensions {
+  font-size: 12px;
+  width: 100%;
+  padding-left: 8px;
+  margin-top: -8px;
+}
+
+/* Hide the duplicate select buttons views_infinite_scroll adds in the
+   media library modal. Inert when that module is absent. */
+.media-library-widget-modal .ui-dialog-buttonset.form-actions button.media-library-select.ui-widget:not(:first-child) {
+  display: none !important;
+}
+[data-drupal-views-infinite-scroll-pager="automatic"] {
+  bottom: 0;
+}
+
+/* Media admin table: keep thumbnails a sane size and the usage column tidy. */
+.view-media .views-field-thumbnail-target-id img {
+  max-width: 100px;
+  height: auto;
+}
+.view-media .views-field-citizen-media-files-usage-count a {
+  white-space: nowrap;
+}

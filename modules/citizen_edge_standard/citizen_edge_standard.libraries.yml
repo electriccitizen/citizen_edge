@@ -1,0 +1,4 @@
+media-admin:
+  css:
+    theme:
+      css/media-admin.css: {}

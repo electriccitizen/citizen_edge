@@ -1,0 +1,22 @@
+{
+    "name": "electriccitizen/citizen_edge",
+    "description": "Portable media file lifecycle package: entity usage tracking, file replace, file delete, and host-aware CDN cache purging on file replace/delete.",
+    "type": "drupal-custom-module",
+    "license": "GPL-2.0-or-later",
+    "require": {
+        "drupal/entity_usage": "^2.0@beta",
+        "drupal/media_entity_file_replace": "^1.3",
+        "drupal/media_file_delete": "^1.3"
+    },
+    "suggest": {
+        "drupal/purge": "Required on Acquia-hosted sites for edge purging (with drupal/acquia_purge).",
+        "drupal/acquia_purge": "Required on Acquia-hosted sites for edge purging."
+    },
+    "extra": {
+        "patches": {
+            "drupal/media_entity_file_replace": {
+                "Skip image_path_flush for non-image files (#3619311, seconds of NFS stats per replace)": "https://www.drupal.org/files/issues/2026-08-26/media_entity_file_replace-skip-flush-non-images.patch"
+            }
+        }
+    }
+}

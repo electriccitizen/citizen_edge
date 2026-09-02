@@ -1,0 +1,21 @@
+services:
+  logger.channel.citizen_edge:
+    parent: logger.channel_base
+    arguments: ['citizen_edge']
+
+  citizen_edge.host_detector:
+    class: Drupal\citizen_edge\HostDetector
+    arguments: ['@settings']
+
+  citizen_edge.edge_purger:
+    class: Drupal\citizen_edge\EdgePurger
+    tags:
+      - { name: needs_destruction }
+    arguments:
+      - '@citizen_edge.host_detector'
+      - '@logger.channel.citizen_edge'
+      - '@file_url_generator'
+      - '@entity_type.manager'
+      - '@settings'
+      - '@queue'
+      - '@http_client'

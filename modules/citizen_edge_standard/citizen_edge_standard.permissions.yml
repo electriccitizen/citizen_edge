@@ -1,0 +1,3 @@
+replace media files:
+  title: 'Replace media files'
+  description: 'Use the Media Entity File Replace widget on media edit forms. The EC standard grants this to site managers only.'
