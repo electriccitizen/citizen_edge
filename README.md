@@ -52,13 +52,18 @@ query-free Views field for a per-row usage count.
 ## Requirements
 
 - Drupal `^10.3 || ^11` with the `media` and `file` core modules.
-- **Acquia**: `drupal/purge` and `drupal/acquia_purge`, with the site's
-  purgers configured (Acquia Platform CDN and/or the Varnish purger — both
-  support `url` invalidations). This module registers its own purge queuer
+- **Acquia with Platform CDN (Fastly)**: nothing extra. The module purges
+  files through the Fastly API using the Platform CDN credentials Acquia
+  already injects (`$settings['acquia_service_credentials']['platform_cdn']`),
+  so it does not depend on the `acquia_purge` URL purger for files. This is
+  what lets it work behind a WAF (see "How purging works").
+- **Acquia without Platform CDN (Varnish only)**: `drupal/purge` and
+  `drupal/acquia_purge`, with the Varnish (Cloud) purger configured (it
+  supports `url` invalidations). This module registers its own purge queuer
   and the site's purge processors (late runtime / cron) drain the queue. The
   purge modules are deliberately NOT hard dependencies, so the package
-  installs cleanly on non-Acquia sites; if purge is missing on an Acquia
-  host, every file change logs a loud warning instead of purging.
+  installs cleanly on non-Acquia sites; if purge is missing on such a host,
+  every file change logs a loud warning instead of purging.
 - **Pantheon**: nothing extra — the platform provides
   `pantheon_clear_edge_paths()`, which this module calls directly.
 - **Cloudways**: there is nothing to purge, by design. Cloudways serves
@@ -215,6 +220,17 @@ $settings['citizen_edge_base_urls'] = [
 // the cron retry queue instead of firing hundreds of API calls at terminate.
 $settings['citizen_edge_inline_purge_limit'] = 500;
 
+// Optional: override Acquia Platform CDN (Fastly) credentials. On Acquia,
+// these are read automatically from the platform's own
+// $settings['acquia_service_credentials']['platform_cdn'], so you normally
+// set nothing. Provide them explicitly only for a Fastly service that is not
+// delivered through Acquia's platform config, keeping the token out of
+// committed code. See the Acquia Platform CDN section below.
+$settings['citizen_edge_fastly'] = [
+  'service_id' => '<fastly service id>',
+  'token' => getenv('FASTLY_API_TOKEN'),
+];
+
 // Optional Cloudflare layer — see below.
 $settings['citizen_edge_cloudflare'] = [
   'zone_id' => '<zone id>',
@@ -235,15 +251,25 @@ $settings['citizen_edge_cloudflare'] = [
   measured seconds INSIDE the editor's save request. Purging a URL the edge
   never cached is a no-op, so blind purging trades bounded purge-queue noise
   for seconds of editor-facing latency.
-- **Deferral**: Pantheon and Cloudflare purges are network calls, so they are
-  collected during the request, deduplicated, and executed at kernel
-  terminate, after the response has been sent. Acquia stays inline because
-  its purge is only a local queue add; the purge module's processors do the
-  network work and carry their own retry semantics.
-- **Retry**: a Pantheon or Cloudflare purge that fails is placed on the core
-  queue `citizen_edge_edge_purge` and retried by cron, up to five
+- **Deferral**: Acquia Platform CDN (Fastly), Pantheon, and Cloudflare purges
+  are network calls, so they are collected during the request, deduplicated,
+  and executed at kernel terminate, after the response has been sent. Acquia
+  *without* Platform CDN stays inline because its purge is only a local queue
+  add; the purge module's processors do the network work and carry their own
+  retry semantics.
+- **Retry**: a Fastly, Pantheon, or Cloudflare purge that fails is placed on
+  the core queue `citizen_edge_edge_purge` and retried by cron, up to five
   attempts, then logged as an error with the URLs so it can be purged by
   hand. Drain on demand with `drush queue:run citizen_edge_edge_purge`.
+- **Acquia Platform CDN (Fastly)**: file URLs are purged through the Fastly
+  API (`POST api.fastly.com/purge/<url>`) using the site's Platform CDN
+  credentials, not through `acquia_purge`'s URL purger. That purger sends an
+  HTTP `PURGE` to the file URL, which a WAF in front of the domain (e.g.
+  Radware Bot Manager, common on government sites) challenges before it
+  reaches Fastly, so files never clear. The API call goes to `api.fastly.com`
+  and never touches the public domain, so no WAF intercepts it — the same
+  channel Acquia's own documented tag and domain purges use. Purges are hard,
+  so a deleted file's URL returns to a 404 at once.
 - **Pantheon** paths are sent with their query strings. The Global CDN keys
   derivative URLs on `?itok=` and `pantheon_clear_edge_paths()` honors it
   (verified on a live environment: a purged derivative reset to age 0 while

@@ -199,6 +199,72 @@ class EdgePurgerTest extends KernelTestBase {
   }
 
   /**
+   * On Acquia Platform CDN, file URLs are deferred to the Fastly layer.
+   */
+  public function testAcquiaPlatformCdnDefersFastly(): void {
+    $this->setSetting('citizen_edge_host', 'acquia');
+    $this->setSetting('citizen_edge_fastly', ['service_id' => 'svc', 'token' => 'tok']);
+    $purger = $this->purger();
+    $purger->purgeFile($this->createFile(), 'test');
+    $pending = $purger->getPending();
+    $this->assertCount(1, $pending);
+    $this->assertSame('fastly', $pending[0][0]);
+  }
+
+  /**
+   * Acquia without Platform CDN credentials does not use the Fastly layer.
+   */
+  public function testAcquiaWithoutPlatformCdnDoesNotDeferFastly(): void {
+    $this->setSetting('citizen_edge_host', 'acquia');
+    $purger = $this->purger();
+    // No purge module is installed in this kernel test, so the Varnish queue
+    // path logs a warning and defers nothing. The point is that the 'fastly'
+    // layer is NOT selected without Platform CDN credentials.
+    $purger->purgeFile($this->createFile(), 'test');
+    $this->assertSame([], $purger->getPending());
+  }
+
+  /**
+   * A successful Fastly purge goes to api.fastly.com and leaves no queue item.
+   *
+   * The request must target the Fastly API host, never the site's public
+   * domain — that is what lets the purge slip past a WAF fronting the domain.
+   */
+  public function testFastlyPurgeSuccess(): void {
+    $this->setSetting('citizen_edge_host', 'acquia');
+    $this->setSetting('citizen_edge_fastly', ['service_id' => 'svc', 'token' => 'tok']);
+    $this->setSetting('citizen_edge_base_urls', ['https://dcyf.example.gov']);
+    $purger = $this->purger();
+    $this->mock->append(new Response(200, [], '{"status":"ok","id":"1-2-3"}'));
+    $purger->purgeUrls(['https://dcyf.example.gov/sites/default/files/a.pdf'], 'test');
+    $purger->flush();
+    $request = $this->mock->getLastRequest();
+    $this->assertNotNull($request);
+    $this->assertSame('POST', $request->getMethod());
+    $this->assertStringStartsWith('https://api.fastly.com/purge/', (string) $request->getUri());
+    $this->assertStringContainsString('dcyf.example.gov', (string) $request->getUri());
+    $this->assertSame('tok', $request->getHeaderLine('Fastly-Key'));
+    $this->assertSame(0, $this->container->get('queue')->get(EdgePurger::QUEUE_NAME)->numberOfItems());
+  }
+
+  /**
+   * A non-ok Fastly response (e.g. a WAF challenge) is queued for retry.
+   */
+  public function testFastlyPurgeFailureIsQueued(): void {
+    $this->setSetting('citizen_edge_host', 'acquia');
+    $this->setSetting('citizen_edge_fastly', ['service_id' => 'svc', 'token' => 'tok']);
+    $purger = $this->purger();
+    $queue = $this->container->get('queue')->get(EdgePurger::QUEUE_NAME);
+    $this->mock->append(new Response(403, [], '<html>bot challenge</html>'));
+    $purger->purgeUrls(['https://example.com/sites/default/files/a.pdf'], 'test');
+    $purger->flush();
+    $this->assertSame(1, $queue->numberOfItems(), 'A non-ok Fastly response is queued for retry.');
+    $item = $queue->claimItem();
+    $this->assertSame('fastly', $item->data['layer']);
+    $this->assertSame(1, $item->data['attempts']);
+  }
+
+  /**
    * A batch is abandoned after the maximum number of attempts.
    */
   public function testPurgeIsAbandonedAfterMaxAttempts(): void {

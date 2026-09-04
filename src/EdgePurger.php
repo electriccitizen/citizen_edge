@@ -15,8 +15,15 @@ use Psr\Log\LoggerInterface;
  * Purges file URLs from the hosting platform's edge cache.
  *
  * Host support:
- * - Acquia: queues "url" invalidations through the purge module, which the
- *   site's configured purgers (Acquia Platform CDN and/or Varnish) process.
+ * - Acquia Platform CDN (Fastly): purges each file URL through the Fastly API
+ *   (POST api.fastly.com/purge/<url>) using the platform's own Platform CDN
+ *   credentials. This is used in preference to the acquia_purge module's URL
+ *   purger, which sends an HTTP PURGE to the file URL that a WAF in front of
+ *   the domain (e.g. Radware Bot Manager, common on government sites) blocks
+ *   before it reaches Fastly. The API call goes to api.fastly.com and never
+ *   touches the public domain, so no WAF can intercept it.
+ * - Acquia without Platform CDN (Varnish only): queues "url" invalidations
+ *   through the purge module, which the site's Varnish (Cloud) purger process.
  * - Pantheon: calls pantheon_clear_edge_paths(), provided by the platform.
  * - Cloudways: nothing to purge — files are served nginx-direct with no
  *   server-side cache (vendor-confirmed by design); logged for clarity.
@@ -166,8 +173,20 @@ class EdgePurger implements DestructableInterface {
     }
     switch ($this->hostDetector->getHost()) {
       case HostDetector::ACQUIA:
-        // Inline: adding to the purge queue is a fast local operation.
-        $this->purgeAcquia($urls, $reason);
+        if ($this->acquiaPlatformCdnConfig()) {
+          // Fastly (Platform CDN) is the outermost edge on this site. Purge it
+          // directly via the Fastly API rather than through acquia_purge's URL
+          // purger, whose PURGE-to-URL request is blocked by any WAF fronting
+          // the domain. Deferred: it is a network call, kept off the editor's
+          // save request (destruct/flush), with retry-queue semantics.
+          $this->defer('fastly', $urls, $reason);
+        }
+        else {
+          // Plain Acquia (Varnish only, no Platform CDN): the purge module's
+          // queue and Cloud purger handle it. Inline: adding to the purge
+          // queue is a fast local operation.
+          $this->purgeAcquia($urls, $reason);
+        }
         break;
 
       case HostDetector::PANTHEON:
@@ -296,6 +315,7 @@ class EdgePurger implements DestructableInterface {
    */
   protected function execute(string $layer, array $urls, string $reason, int $attempts): void {
     $failed = match ($layer) {
+      'fastly' => $this->purgeFastly($urls, $reason),
       'pantheon' => $this->purgePantheon($urls, $reason),
       'cloudflare' => $this->purgeCloudflare($urls, $reason),
       default => [],
@@ -426,6 +446,136 @@ class EdgePurger implements DestructableInterface {
         '@urls' => $this->summarizeUrls($urls),
       ]);
     }
+  }
+
+  /**
+   * Purges URLs from Acquia Platform CDN (Fastly) via the Fastly API.
+   *
+   * The acquia_purge module's Platform CDN purger invalidates a URL by sending
+   * an HTTP PURGE request to the URL itself, expecting Fastly to intercept it.
+   * When a WAF sits in front of the domain (e.g. Radware Bot Manager, common
+   * on government sites) that PURGE is challenged and never reaches Fastly, so
+   * files never clear from the edge. This purges each URL through Fastly's API
+   * instead (POST https://api.fastly.com/purge/<url> with the Platform CDN
+   * token) — a call to api.fastly.com that never touches the public domain and
+   * so is not subject to the WAF. It is the same channel Acquia's own
+   * documented tag and domain purges use. Purges are hard by default, so a
+   * deleted file's URL returns to a 404 immediately.
+   *
+   * @param string[] $urls
+   *   Absolute URLs to purge.
+   * @param string $reason
+   *   Trigger description for logging.
+   *
+   * @return string[]
+   *   URLs whose purge failed and should be retried.
+   */
+  protected function purgeFastly(array $urls, string $reason): array {
+    $config = $this->acquiaPlatformCdnConfig();
+    if (!$config) {
+      // Not transient: retrying cannot help until the credentials appear.
+      $this->logger->warning('Acquia Platform CDN purge requested but no Fastly credentials are available; NOT purged (@reason): @urls', [
+        '@reason' => $reason,
+        '@urls' => $this->summarizeUrls($urls),
+      ]);
+      return [];
+    }
+    if (!$this->httpClient) {
+      // Configuration problem, not transient.
+      $this->logger->error('Fastly purge configured but no HTTP client available; NOT purged (@reason): @urls', [
+        '@reason' => $reason,
+        '@urls' => $this->summarizeUrls($urls),
+      ]);
+      return [];
+    }
+    $failed = [];
+    $purged = 0;
+    // Fastly's single-URL purge endpoint takes one URL per call.
+    foreach ($urls as $url) {
+      try {
+        $response = $this->httpClient->request('POST', 'https://api.fastly.com/purge/' . $url, [
+          'headers' => [
+            'Fastly-Key' => $config['token'],
+            'Accept' => 'application/json',
+          ],
+          'http_errors' => FALSE,
+          'connect_timeout' => 5,
+          'timeout' => 10,
+        ]);
+        $status = $response->getStatusCode();
+        $raw = (string) $response->getBody();
+        $body = json_decode($raw, TRUE);
+        if ($status === 200 && isset($body['status']) && $body['status'] === 'ok') {
+          $purged++;
+        }
+        else {
+          $this->logger->error('Fastly purge FAILED (@reason, HTTP @status): @body. URL: @url', [
+            '@reason' => $reason,
+            '@status' => $status,
+            '@body' => substr($raw, 0, 200),
+            '@url' => $url,
+          ]);
+          $failed[] = $url;
+        }
+      }
+      catch (\Exception $e) {
+        $this->logger->error('Fastly purge request failed (@reason): @message. URL: @url', [
+          '@reason' => $reason,
+          '@message' => $e->getMessage(),
+          '@url' => $url,
+        ]);
+        $failed[] = $url;
+      }
+    }
+    if ($purged) {
+      $this->logger->notice('Purged @count URL(s) from Acquia Platform CDN / Fastly (@reason): @urls', [
+        '@count' => $purged,
+        '@reason' => $reason,
+        '@urls' => $this->summarizeUrls($urls),
+      ]);
+    }
+    return $failed;
+  }
+
+  /**
+   * Returns Acquia Platform CDN (Fastly) purge credentials, or NULL.
+   *
+   * Acquia injects the Platform CDN service id and token into platform
+   * settings as $settings['acquia_service_credentials']['platform_cdn'], the
+   * same source the acquia_purge module reads. A site may instead set the
+   * credentials explicitly (for a Fastly service that is not delivered through
+   * Acquia's platform config), keeping the token OUT of committed code:
+   *
+   * @code
+   * $settings['citizen_edge_fastly'] = [
+   *   'service_id' => '<fastly service id>',
+   *   'token' => getenv('FASTLY_API_TOKEN'),
+   * ];
+   * @endcode
+   *
+   * @return array|null
+   *   ['service_id' => string, 'token' => string] when configured, else NULL.
+   */
+  protected function acquiaPlatformCdnConfig(): ?array {
+    $explicit = $this->settings->get('citizen_edge_fastly');
+    if (is_array($explicit) && !empty($explicit['service_id']) && !empty($explicit['token'])) {
+      return [
+        'service_id' => (string) $explicit['service_id'],
+        'token' => (string) $explicit['token'],
+      ];
+    }
+    $creds = $this->settings->get('acquia_service_credentials');
+    $cdn = is_array($creds) ? ($creds['platform_cdn'] ?? NULL) : NULL;
+    if (is_array($cdn) && ($cdn['vendor'] ?? '') === 'fastly') {
+      $conf = $cdn['configuration'] ?? [];
+      if (!empty($conf['service_id']) && !empty($conf['token'])) {
+        return [
+          'service_id' => (string) $conf['service_id'],
+          'token' => (string) $conf['token'],
+        ];
+      }
+    }
+    return NULL;
   }
 
   /**
