@@ -4,6 +4,7 @@ namespace Drupal\citizen_edge\Drush\Commands;
 
 use Drupal\citizen_edge\EdgePurger;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\File\FileSystemInterface;
 use Drupal\Core\File\FileUrlGeneratorInterface;
 use Drupal\file\Entity\File;
 use Drush\Attributes as CLI;
@@ -23,6 +24,7 @@ final class CitizenEdgeCommands extends DrushCommands {
     protected EdgePurger $edgePurger,
     protected EntityTypeManagerInterface $entityTypeManager,
     protected FileUrlGeneratorInterface $fileUrlGenerator,
+    protected FileSystemInterface $fileSystem,
   ) {
     parent::__construct();
   }
@@ -35,6 +37,7 @@ final class CitizenEdgeCommands extends DrushCommands {
       $container->get('citizen_edge.edge_purger'),
       $container->get('entity_type.manager'),
       $container->get('file_url_generator'),
+      $container->get('file_system'),
     );
   }
 
@@ -241,7 +244,23 @@ final class CitizenEdgeCommands extends DrushCommands {
       $fetch();
 
       // 3. Disk overwrite only: the edge should keep serving stale v1.
-      file_put_contents($uri, "EDGE-TEST-V2-$marker");
+      // Write a replacement that differs from v1 in BOTH byte length and
+      // modification time, the way a real file replace does. nginx derives
+      // its ETag from the file's mtime and size and its Last-Modified from
+      // the mtime, so a same-length body written in the same wall-clock
+      // second yields an identical ETag and Last-Modified. A revalidating
+      // edge (e.g. Pantheon Global CDN) then answers the post-purge refetch
+      // with a 304 and legitimately keeps v1 — a false FAIL that does not
+      // reflect how a production replace behaves. A distinct size defeats
+      // the ETag match and an advanced mtime defeats the Last-Modified match.
+      $v1_mtime = @filemtime($this->fileSystem->realpath($uri)) ?: time();
+      file_put_contents($uri, "EDGE-TEST-V2-$marker-REPLACED-WITH-A-DISTINCT-LONGER-BODY");
+      if ($real = $this->fileSystem->realpath($uri)) {
+        if ((@filemtime($real) ?: 0) <= $v1_mtime) {
+          @touch($real, $v1_mtime + 2);
+        }
+        clearstatcache(TRUE, $real);
+      }
       sleep(1);
       $r = $fetch();
       if (str_contains($r['body'], "EDGE-TEST-V1-$marker")) {
@@ -280,8 +299,8 @@ final class CitizenEdgeCommands extends DrushCommands {
         }
       }
       if ($fresh && $repurged) {
-        $results['fresh after purge (replace)'] = 'PASS (after re-purge — origin propagation race detected; see output)';
-        $this->io()->warning('The first purge evicted but the edge re-cached stale origin content (origin/NFS propagation lag). A re-purge succeeded once the origin settled. Production file replaces on this environment are exposed to the same race; consider a delayed re-purge.');
+        $results['fresh after purge (replace)'] = 'PASS (needed a re-purge; origin was slow to settle — see output)';
+        $this->io()->warning('The first purge did not serve fresh content immediately, but a re-purge a few seconds later did. The test now writes a replacement of a different size and timestamp, so this is not the identical-ETag revalidation artifact; it points at the origin still settling a just-written file. Treat it as an origin/filesystem question on this environment, not as evidence that production needs a second scheduled purge.');
       }
       else {
         $results['fresh after purge (replace)'] = $fresh ? 'PASS' : 'FAIL (still serving: ' . substr($r['body'], 0, 40) . ' after 5 tries with re-purges)';
