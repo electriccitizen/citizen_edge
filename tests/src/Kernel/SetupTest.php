@@ -288,6 +288,7 @@ class SetupTest extends KernelTestBase {
     $display = View::load('media')->getDisplay('default');
     $this->assertSame($filters_before, $display['display_options']['filters'], 'Filters are untouched.');
     $this->assertArrayHasKey('citizen_edge_usage_count', $display['display_options']['fields']);
+    $this->assertArrayHasKey('thumbnail__width', $display['display_options']['fields'], 'Dimensions column merged.');
     $this->assertArrayNotHasKey('filesize', $display['display_options']['fields'], 'Image size column pruned without field_media_image.');
     $this->assertNotEmpty($this->container->get('state')->get('citizen_edge_standard.previous_view'));
 

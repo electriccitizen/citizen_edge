@@ -180,9 +180,10 @@ deliberately OVERRIDES existing configuration:
   up manually. Anonymous or authenticated holding delete permissions is
   warned about, never touched.
 - Merges the standard COLUMNS into the site's existing media view — bulk
-  ops, Thumbnail, Media name, Provider, Image size, Usage count, Author,
-  Changed, Actions — while leaving the site's filters, sorts, pager, style,
-  and aggregation settings untouched, and adds media admin CSS.
+  ops, Thumbnail, Media name, Provider, Dimensions (width x height, images
+  only), Image size, Usage count, Author, Changed, Actions — while leaving
+  the site's filters, sorts, pager, style, and aggregation settings
+  untouched, and adds media admin CSS.
   Site-conditional columns prune where the field is absent (Image size needs
   `field_media_image`). Never enables views aggregation. The rollback for
   the merge is the site's exported config in git (a copy of the previous
